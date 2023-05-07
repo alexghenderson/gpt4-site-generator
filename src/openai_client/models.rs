@@ -1,12 +1,24 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
+pub enum FinishReason {
+    #[serde(rename = "stop")]
+    Stop,
+    #[serde(rename = "length")]
+    Length,
+    #[serde(rename = "content_filter")]
+    ContentFilter,
+    #[serde(rename = "null")]
+    Null,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
-pub struct Request {
+pub struct ChatCompletionsRequest {
     model: Model,
     messages: Vec<Message>,
 }
 
-impl Request {
+impl ChatCompletionsRequest {
     pub fn new(model: Model) -> Self {
         Self {
             model,
@@ -19,7 +31,6 @@ impl Request {
         self
     }
 }
-
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Model {
     #[serde(rename = "gpt-4")]
@@ -28,17 +39,8 @@ pub enum Model {
     GPT3_5Turbo,
 }
 
-impl Into<String> for Model {
-    fn into(self) -> String {
-        match self {
-            Model::GPT4 => "gpt-4".into(),
-            Model::GPT3_5Turbo => "gpt-3.5-turbo".into(),
-        }
-    }
-}
-
 #[derive(Serialize, Deserialize, Debug)]
-pub struct Response {
+pub struct ChatCompletionsResponse {
     id: String,
     object: String,
     created: u64,
@@ -47,7 +49,7 @@ pub struct Response {
     choices: Vec<Choice>,
 }
 
-impl Response {
+impl ChatCompletionsResponse {
     pub fn first_choice(&self) -> Option<&Choice> {
         self.choices.first()
     }
@@ -93,7 +95,6 @@ impl TokenUsage {
         self.total_tokens
     }
 }
-
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ValidationError {
     Role(String),
@@ -108,53 +109,6 @@ pub enum Role {
     System,
     #[serde(rename = "user")]
     User,
-}
-
-impl TryFrom<String> for Role {
-    type Error = ValidationError;
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        match value.as_str() {
-            "assistant" => Ok(Self::Assistant),
-            "user" => Ok(Self::User),
-            "system" => Ok(Self::System),
-            _ => Err(ValidationError::Role(value)),
-        }
-    }
-}
-
-impl Into<String> for Role {
-    fn into(self) -> String {
-        match self {
-            Role::Assistant => "assistant".into(),
-            Role::User => "user".into(),
-            Role::System => "system".into(),
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
-pub enum FinishReason {
-    #[serde(rename = "stop")]
-    Stop,
-    #[serde(rename = "length")]
-    Length,
-    #[serde(rename = "content_filter")]
-    ContentFilter,
-    #[serde(rename = "null")]
-    Null,
-}
-
-impl TryFrom<String> for FinishReason {
-    type Error = ValidationError;
-    fn try_from(value: String) -> Result<FinishReason, ValidationError> {
-        match value.as_str() {
-            "stop" => Ok(Self::Stop),
-            "length" => Ok(Self::Length),
-            "content_filter" => Ok(Self::ContentFilter),
-            "null" => Ok(Self::Null),
-            _ => Err(ValidationError::FinishReason(value)),
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -201,5 +155,14 @@ impl Message {
 
     pub fn get_role(&self) -> Role {
         self.role
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, thiserror::Error)]
+pub struct NoChoicesError {}
+
+impl std::fmt::Display for NoChoicesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("No choices returned for prompt")
     }
 }

@@ -1,66 +1,104 @@
+#[macro_use]
+extern crate rocket;
+
 mod cache_client;
 mod chat_client;
+mod openai_client;
 
+use anyhow::{anyhow, Error};
+use rocket::futures::lock::Mutex;
 use std::net::SocketAddr;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use axum::extract::{Path, State};
-use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use axum::Router;
-
-use chat_client::{ChatClient, Message, Model, Request, Role};
+use rocket::http::{ContentType, Status};
+use rocket::request::Request;
+use rocket::response::{Responder, Response};
 
 use crate::cache_client::{Cache, MemoryCache};
-use crate::chat_client::ChatClientError;
+use crate::openai_client::client::Client as OpenAIClient;
 
-#[derive(Clone)]
+const SYSTEM_PROMPT: &'static str = "You are a site content generator. You generate a full, valid HTML page for a website for a given catagory and topic. The contents should be similar to an encyclopedia in nature, and include related links in the form o f`/:category/:topic`.";
+
 struct AppState {
-    chat_client: Arc<ChatClient>,
-    cache_client: Arc<Mutex<MemoryCache<(String, String), String>>>,
+    cache_client: Mutex<MemoryCache<(String, String), String>>,
+    openai_client: Mutex<OpenAIClient>,
 }
 
-#[tokio::main]
-async fn main() {
-    let client = AppState {
-        chat_client: Arc::new(ChatClient::new(
-            std::env::var("OPENAPI_KEY").expect("OPENAPI_KEY environment variable required"),
+#[launch]
+async fn rocket() -> _ {
+    let state = Arc::new(AppState {
+        openai_client: Mutex::new(OpenAIClient::new(
+            std::env::var("OPENAI_KEY").expect("OPENAI_KEY environment variable is required"),
+            reqwest::Client::new(),
         )),
-        cache_client: Arc::new(Mutex::new(MemoryCache::new())),
-    };
+        cache_client: Mutex::new(MemoryCache::new()),
+    });
 
-    let app = Router::new()
-        .route("/:category/:topic", get(root))
-        .with_state(client);
-
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
-    println!("Starting server");
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
-        .await
-        .expect("Failed to start axum");
+    rocket::build().mount("/", routes![root]).manage(state)
 }
 
-async fn root(
-    Path((category, topic)): Path<(String, String)>,
-    State(AppState {
-        chat_client,
-        cache_client,
-    }): State<AppState>,
-) -> Response {
-    if let Some(response) = cache_client
-        .lock()
-        .unwrap()
-        .read_key(&(category.clone(), topic.clone()))
-    {
-        return axum::response::Html(response.clone()).into_response();
+struct HtmlResponse(String);
+
+impl From<String> for HtmlResponse {
+    fn from(value: String) -> Self {
+        Self(value)
     }
-    let prompt = "You are a site content generator. You generate a full, valid HTML page for a website for a given catagory and topic. The contents should be similar to an encyclopedia in nature, and include related links in the form o f`/:category/:topic`.";
-    let response = chat_client
-        .get_completions(
-            Request::new(Model::GPT4)
-                .add_message(Message::new(Role::Assistant, prompt))
+}
+
+impl<'r> Responder<'r, 'r> for HtmlResponse {
+    fn respond_to(self, req: &'r Request<'_>) -> rocket::response::Result<'r> {
+        Response::build_from(self.0.respond_to(req)?)
+            .header(ContentType::HTML)
+            .status(Status::Ok)
+            .ok()
+    }
+}
+
+struct AppError(anyhow::Error);
+
+impl From<anyhow::Error> for AppError {
+    fn from(value: anyhow::Error) -> Self {
+        Self(value)
+    }
+}
+
+impl<'r> Responder<'r, 'r> for AppError {
+    fn respond_to(self, req: &'r Request<'_>) -> rocket::response::Result<'r> {
+        Response::build_from(self.0.to_string().respond_to(req)?)
+            .status(Status::InternalServerError)
+            .ok()
+    }
+}
+
+type AppResponse = Result<HtmlResponse, AppError>;
+
+#[get("/<category>/<topic>")]
+async fn root(
+    category: String,
+    topic: String,
+    state: &rocket::State<Arc<AppState>>,
+) -> AppResponse {
+    use openai_client::client::OpenAIClient;
+    use openai_client::models::*;
+    {
+        if let Some(response) = state
+            .cache_client
+            .lock()
+            .await
+            .read_key(&(category.clone(), topic.clone()))
+        {
+            return Ok(response.clone().into());
+        }
+    }
+
+    let result = state
+        .clone()
+        .openai_client
+        .lock()
+        .await
+        .get_chat_completions(
+            ChatCompletionsRequest::new(Model::GPT4)
+                .add_message(Message::new(Role::Assistant, SYSTEM_PROMPT))
                 .add_message(Message::new(
                     Role::User,
                     format!(
@@ -70,29 +108,24 @@ async fn root(
                 )),
         )
         .await
-        .map(|response| {
-            response
-                .first_choice()
-                .map(|choice| choice.get_message().get_content().clone())
-        });
+        .map_err(|e| {
+            println!("{:?}", e);
+            e
+        })?;
 
-    use axum::http::StatusCode;
-    match response {
-        Ok(Some(response)) => {
-            cache_client
-                .lock()
-                .unwrap()
-                .write_key((category.clone(), topic.clone()), response.clone())
-                .expect("Failed to write cache");
-            axum::response::Html(response).into_response()
-        }
-        Ok(None) => (StatusCode::NOT_FOUND, "Not Found").into_response(),
-        Err(ChatClientError::NetworkError) => {
-            (StatusCode::REQUEST_TIMEOUT, "Request Timeout").into_response()
-        }
-        Err(ChatClientError::EmptyResponse) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, "Internal Error").into_response()
-        }
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal Error").into_response(),
-    }
+    let response = result
+        .first_choice()
+        .ok_or(anyhow::Error::from(NoChoicesError {}))?
+        .get_message()
+        .get_content()
+        .clone();
+
+    state
+        .cache_client
+        .lock()
+        .await
+        .write_key((category.clone(), topic.clone()), response.clone())
+        .expect("Failed to write cache");
+
+    Ok(response.clone().into())
 }
